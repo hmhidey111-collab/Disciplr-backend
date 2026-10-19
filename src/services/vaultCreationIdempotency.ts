@@ -72,7 +72,11 @@ interface MemoryClaim {
   vaultId: string | null
 }
 
-export type CreateWithClient<T> = (client: PoolClient | null) => Promise<VaultCreationResponse<T>>
+export interface IdempotencyActions<V, T> {
+  createVault: (client: PoolClient | null) => Promise<V>
+  getVault: (client: PoolClient | null, vaultId: string) => Promise<V | null>
+  buildResponse: (vault: V) => Promise<T>
+}
 
 const memoryClaims = new Map<string, MemoryClaim>()
 const memoryMutex = new AsyncMutex()
@@ -104,10 +108,10 @@ function parseResponse<T>(value: unknown): T {
   return value as T
 }
 
-async function createInMemory<T>(
+async function createInMemory<V extends { id: string }, T>(
   options: CoordinatorOptions,
-  create: CreateWithClient<T>,
-): Promise<VaultCreationResponse<T> & { replayed: boolean }> {
+  actions: IdempotencyActions<V, T>,
+): Promise<{ vault: V; response: T; replayed: boolean }> {
   return memoryMutex.runExclusive(async () => {
     const now = (options.now ?? (() => new Date()))().getTime()
     const current = memoryClaims.get(options.key)
@@ -115,26 +119,44 @@ async function createInMemory<T>(
       assertOwner(current.owner, options.owner)
       if (current.requestHash !== options.requestHash) throw new VaultCreationIdempotencyConflictError()
       if (current.response !== null) {
-        return { vault: { id: current.vaultId } as PersistedVault, response: current.response as T, replayed: true }
+        return { vault: { id: current.vaultId } as V, response: current.response as T, replayed: true }
       }
       throw new VaultCreationInProgressError()
     }
 
-    const claim: MemoryClaim = {
-      requestHash: options.requestHash,
-      owner: options.owner,
-      expiresAt: now + effectiveTtl(options.ttlMs),
-      response: null,
-      vaultId: null,
+    let claim = current
+    if (!claim) {
+      claim = {
+        requestHash: options.requestHash,
+        owner: options.owner,
+        expiresAt: now + effectiveTtl(options.ttlMs),
+        response: null,
+        vaultId: null,
+      }
+      memoryClaims.set(options.key, claim)
+    } else {
+      claim.expiresAt = now + effectiveTtl(options.ttlMs)
     }
-    memoryClaims.set(options.key, claim)
+
     try {
-      const created = await create(null)
-      claim.response = created.response
-      claim.vaultId = created.vault.id
-      return { ...created, replayed: false }
+      let vault: V
+      if (claim.vaultId) {
+        const existing = await actions.getVault(null, claim.vaultId)
+        if (!existing) throw new Error('Vault missing during memory replay')
+        vault = existing
+      } else {
+        vault = await actions.createVault(null)
+        claim.vaultId = vault.id
+      }
+      const response = await actions.buildResponse(vault)
+      claim.response = response
+      return { vault, response, replayed: false }
     } catch (error) {
-      memoryClaims.delete(options.key)
+      if (!claim.vaultId) {
+        memoryClaims.delete(options.key)
+      } else {
+        claim.response = null
+      }
       throw error
     }
   })
@@ -181,17 +203,17 @@ async function claimDurably(
   await client.query(
     `UPDATE vault_creation_idempotency
         SET state = 'pending', expires_at = $2, updated_at = $3,
-            response = NULL, vault_id = NULL
+            response = NULL
       WHERE idempotency_key = $1`,
     [options.key, expiresAt, now],
   )
-  return { claimed: true }
+  return { claimed: true, vaultId: existing.vault_id }
 }
 
 async function completeDurably<T>(
   client: PoolClient,
   key: string,
-  vault: PersistedVault,
+  vault: { id: string },
   response: T,
   now: Date,
 ): Promise<void> {
@@ -205,40 +227,81 @@ async function completeDurably<T>(
 }
 
 /**
- * Execute vault creation under one durable idempotency reservation.
- *
- * The reservation, vault rows, milestone rows, and final response commit in
- * one PostgreSQL transaction. A concurrent insert blocks on the unique key;
- * after the first transaction commits it reads the stored response and never
- * creates a second vault. Expired pending claims can be reclaimed safely.
+ * Claims (or inspects) the reservation row for `options.key` using a dedicated
+ * connection so the lock is never held while the caller's create callback runs.
  */
-export async function createVaultIdempotently<T>(
+async function reserveDurably(
+  pool: Pool,
   options: CoordinatorOptions,
-  create: CreateWithClient<T>,
-  poolOverride?: Pool | null,
-): Promise<VaultCreationResponse<T> & { replayed: boolean }> {
-  const pool = poolOverride === undefined ? getPgPool() : poolOverride
-  if (!pool) return createInMemory(options, create)
-
+): Promise<{ claimed: boolean; response?: unknown; vaultId?: string }> {
   const client = await pool.connect()
+  try {
+    return await claimDurably(client, options)
+  } finally {
+    client.release()
+  }
+}
+
+/**
+ * Best-effort removal of a pending reservation so a failed attempt can be
+ * retried immediately instead of waiting for the TTL to expire. A row that
+ * cannot be removed here is still reclaimed once it expires.
+ */
+async function clearPendingClaim(pool: Pool, key: string): Promise<void> {
+  const client = await pool.connect()
+  try {
+    await client.query(
+      `DELETE FROM vault_creation_idempotency WHERE idempotency_key = $1 AND state = 'pending'`,
+      [key],
+    )
+  } catch {
+    // Ignore cleanup errors: the reservation expires on its own.
+  } finally {
+    client.release()
+  }
+}
+
+export async function createVaultIdempotently<V extends { id: string }, T>(
+  options: CoordinatorOptions,
+  actions: IdempotencyActions<V, T>,
+  poolOverride?: Pool | null,
+): Promise<{ vault: V; response: T; replayed: boolean }> {
+  const pool = poolOverride === undefined ? getPgPool() : poolOverride
+  if (!pool) return createInMemory(options, actions)
+
+  const durablePool: Pool = pool
   const now = options.now ?? (() => new Date())
+  const claim = await reserveDurably(durablePool, options)
+
+  if (!claim.claimed) {
+    return {
+      vault: { id: claim.vaultId } as V,
+      response: parseResponse<T>(claim.response),
+      replayed: true,
+    }
+  }
+
+  const client = await durablePool.connect()
   try {
     await client.query('BEGIN')
-    const claim = await claimDurably(client, options)
-    if (!claim.claimed) {
-      await client.query('COMMIT')
-      return {
-        vault: { id: claim.vaultId } as PersistedVault,
-        response: parseResponse<T>(claim.response),
-        replayed: true,
-      }
+    // A reclaimed reservation already owns a persisted vault row, so reuse it
+    // rather than creating a second vault for the same idempotency key.
+    let vault: V | null
+    if (claim.vaultId) {
+      vault = await actions.getVault(client, claim.vaultId)
+      if (!vault) throw new Error('Vault missing during idempotent retry')
+    } else {
+      vault = await actions.createVault(client)
     }
-    const created = await create(client)
-    await completeDurably(client, options.key, created.vault, created.response, now())
+    const response = await actions.buildResponse(vault)
+    await completeDurably(client, options.key, vault, response, now())
     await client.query('COMMIT')
-    return { ...created, replayed: false }
+    return { vault, response, replayed: false }
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined)
+    // Drop the pending claim so the user does not have to wait for the TTL
+    // before retrying with the same key.
+    await clearPendingClaim(durablePool, options.key)
     throw error
   } finally {
     client.release()
