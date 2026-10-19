@@ -5,7 +5,11 @@ import request from 'supertest'
 const mockGetVerifierProfile = jest.fn()
 const mockTransitionVerifier = jest.fn()
 const mockCreateOrGetVerifierProfile = jest.fn()
+const mockCreateOrTransitionVerifier = jest.fn()
 const mockGetVerifierStats = jest.fn()
+const mockGetVerifierStatsBatch = jest.fn(async (userIds: string[]) =>
+  new Map(await Promise.all(userIds.map(async (id) => [id, await mockGetVerifierStats(id)] as const))),
+)
 const mockCreateVerifierProfile = jest.fn()
 const mockIsValidStellarAddress = jest.fn()
 const mockUpdateVerifierProfile = jest.fn()
@@ -35,8 +39,10 @@ jest.unstable_mockModule('../src/middleware/rbac.js', () => ({
 jest.unstable_mockModule('../src/services/verifiers.js', () => ({
   getVerifierProfile: mockGetVerifierProfile,
   transitionVerifier: mockTransitionVerifier,
+  createOrTransitionVerifier: mockCreateOrTransitionVerifier,
   createOrGetVerifierProfile: mockCreateOrGetVerifierProfile,
   getVerifierStats: mockGetVerifierStats,
+  getVerifierStatsBatch: mockGetVerifierStatsBatch,
   createVerifierProfile: mockCreateVerifierProfile,
   updateVerifierProfile: mockUpdateVerifierProfile,
   deleteVerifierProfile: mockDeleteVerifierProfile,
@@ -125,12 +131,17 @@ describe('Admin Verifiers Lifecycle - Suspend/Reinstate', () => {
     jest.clearAllMocks()
     mockIsValidStellarAddress.mockResolvedValue(true)
     mockGetVerifierStats.mockResolvedValue(defaultStats)
+    mockCreateOrTransitionVerifier.mockResolvedValue({
+      before: approvedVerifier,
+      after: { ...approvedVerifier, status: 'approved' },
+      changedFields: [],
+      auditLog: null,
+    })
   })
 
   describe('POST /:userId/suspend', () => {
     it('should suspend an approved verifier', async () => {
       mockGetVerifierProfile.mockResolvedValue(approvedVerifier)
-      mockCreateOrGetVerifierProfile.mockResolvedValue(approvedVerifier)
       mockTransitionVerifier.mockResolvedValue({
         before: approvedVerifier,
         after: { ...approvedVerifier, status: 'suspended', suspendedAt: '2026-02-01T00:00:00.000Z' },
@@ -153,25 +164,22 @@ describe('Admin Verifiers Lifecycle - Suspend/Reinstate', () => {
       )
     })
 
-    it('should create a pending profile then return 409 when trying to suspend (pending -> suspended invalid)', async () => {
-      const newProfile = { ...pendingVerifier, userId: 'new-verifier' }
-      mockGetVerifierProfile.mockResolvedValue(newProfile)
-      mockCreateOrGetVerifierProfile.mockResolvedValue(newProfile)
+    it('should return 409 when suspending a pending verifier (pending -> suspended invalid)', async () => {
+      mockGetVerifierProfile.mockResolvedValue(pendingVerifier)
       mockTransitionVerifier.mockRejectedValue(
         new InvalidVerifierStatusTransitionError('pending', 'suspended'),
       )
 
       const res = await request(app)
-        .post('/api/admin/verifiers/new-verifier/suspend')
+        .post('/api/admin/verifiers/verifier-pending/suspend')
         .send()
 
       expect(res.status).toBe(409)
       expect(res.body.error).toContain('Invalid verifier status transition')
     })
 
-    it('should return 500 when createOrGetVerifierProfile fails', async () => {
-      mockGetVerifierProfile.mockResolvedValue(undefined)
-      mockCreateOrGetVerifierProfile.mockRejectedValue(new Error('db error'))
+    it('should return 500 when loading the verifier profile fails', async () => {
+      mockGetVerifierProfile.mockRejectedValue(new Error('db error'))
 
       const res = await request(app)
         .post('/api/admin/verifiers/db-error/suspend')
@@ -182,7 +190,6 @@ describe('Admin Verifiers Lifecycle - Suspend/Reinstate', () => {
 
     it('should return 500 on transition error', async () => {
       mockGetVerifierProfile.mockResolvedValue(approvedVerifier)
-      mockCreateOrGetVerifierProfile.mockResolvedValue(approvedVerifier)
       mockTransitionVerifier.mockRejectedValue(new Error('db error'))
 
       const res = await request(app)
@@ -311,12 +318,40 @@ describe('Admin Verifiers Lifecycle - Suspend/Reinstate', () => {
       expect(res.status).toBe(200)
       expect(res.body.profile.status).toBe('approved')
     })
+
+    it('should early-return when verifier is already approved (no transition needed)', async () => {
+      mockGetVerifierProfile.mockResolvedValue(approvedVerifier)
+
+      const res = await request(app)
+        .post('/api/admin/verifiers/verifier-approved/reinstate')
+        .send()
+
+      expect(res.status).toBe(200)
+      expect(res.body.profile.status).toBe('approved')
+      expect(res.body.changedFields).toEqual([])
+      expect(res.body.auditLogId).toBeNull()
+      // Should NOT call transitionVerifier at all
+      expect(mockTransitionVerifier).not.toHaveBeenCalled()
+    })
+
+    it('should early-return when verifier is already pending (no transition needed)', async () => {
+      mockGetVerifierProfile.mockResolvedValue(pendingVerifier)
+
+      const res = await request(app)
+        .post('/api/admin/verifiers/verifier-pending/reinstate')
+        .send()
+
+      expect(res.status).toBe(200)
+      expect(res.body.profile.status).toBe('pending')
+      expect(res.body.changedFields).toEqual([])
+      expect(res.body.auditLogId).toBeNull()
+      expect(mockTransitionVerifier).not.toHaveBeenCalled()
+    })
   })
 
   describe('Edge Cases', () => {
     it('should succeed (no-op) when suspending an already-suspended verifier', async () => {
       mockGetVerifierProfile.mockResolvedValue(suspendedVerifier)
-      mockCreateOrGetVerifierProfile.mockResolvedValue(suspendedVerifier)
       mockTransitionVerifier.mockResolvedValue({
         before: suspendedVerifier,
         after: suspendedVerifier,
@@ -350,8 +385,7 @@ describe('Admin Verifiers Lifecycle - Suspend/Reinstate', () => {
     })
 
     it('should handle concurrent suspend requests gracefully', async () => {
-      mockGetVerifierProfile.mockResolvedValue(approvedVerifier)
-      mockTransitionVerifier.mockResolvedValue({
+      mockCreateOrTransitionVerifier.mockResolvedValue({
         before: approvedVerifier,
         after: { ...approvedVerifier, status: 'suspended' },
         changedFields: ['status'],
@@ -462,6 +496,73 @@ describe('Admin Verifiers Lifecycle - Suspend/Reinstate', () => {
       expect(res.status).toBe(200)
       expect(res.body.stats).toBeDefined()
       expect(res.body.stats.totalVerifications).toBe(0)
+    })
+  })
+
+  describe('Hostile-input boundary — userId sanitization', () => {
+    it('should reject empty userId on GET /:userId', async () => {
+      const res = await request(app)
+        .get('/api/admin/verifiers/%20')
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('invalid userId')
+    })
+
+    it('should reject excessively long userId on GET /:userId', async () => {
+      const longId = 'x'.repeat(200)
+      const res = await request(app)
+        .get(`/api/admin/verifiers/${longId}`)
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('invalid userId')
+    })
+
+    it('should reject empty userId on DELETE /:userId', async () => {
+      const res = await request(app)
+        .delete('/api/admin/verifiers/%20')
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('invalid userId')
+    })
+
+    it('should reject empty userId on POST /:userId/approve', async () => {
+      const res = await request(app)
+        .post('/api/admin/verifiers/%20/approve')
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('invalid userId')
+    })
+
+    it('should reject empty userId on POST /:userId/suspend', async () => {
+      const res = await request(app)
+        .post('/api/admin/verifiers/%20/suspend')
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('invalid userId')
+    })
+
+    it('should reject empty userId on POST /:userId/reinstate', async () => {
+      const res = await request(app)
+        .post('/api/admin/verifiers/%20/reinstate')
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('invalid userId')
+    })
+
+    it('should reject empty userId on POST /:userId/deactivate', async () => {
+      const res = await request(app)
+        .post('/api/admin/verifiers/%20/deactivate')
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('invalid userId')
+    })
+
+    it('should reject empty userId on POST /:userId/reactivate', async () => {
+      const res = await request(app)
+        .post('/api/admin/verifiers/%20/reactivate')
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('invalid userId')
     })
   })
 })
